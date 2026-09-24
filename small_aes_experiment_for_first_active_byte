@@ -1,0 +1,652 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define NUM_KEYS             (1 << 5)
+
+#define STATE_NIBBLES        16
+#define BLOCK_NIBBLES        16
+#define KEY_BYTES            8
+#define ROUNDS               5
+
+/* ============================================================
+   XOSHIRO128++ PRNG
+   ============================================================ */
+
+static uint32_t rng_state[4];
+
+static inline uint32_t rotl(const uint32_t x, int k)
+{
+    return (x << k) | (x >> (32 - k));
+}
+
+static uint32_t next_prng(void)
+{
+    const uint32_t result =
+        rotl(rng_state[0] + rng_state[3], 7) + rng_state[0];
+
+    const uint32_t t = rng_state[1] << 9;
+
+    rng_state[2] ^= rng_state[0];
+    rng_state[3] ^= rng_state[1];
+    rng_state[1] ^= rng_state[2];
+    rng_state[0] ^= rng_state[3];
+
+    rng_state[2] ^= t;
+    rng_state[3] = rotl(rng_state[3], 11);
+
+    return result;
+}
+
+static void init_prng(uint32_t seed)
+{
+    rng_state[0] = seed ^ 0x12345678;
+    rng_state[1] = seed ^ 0x87654321;
+    rng_state[2] = seed ^ 0xDEADBEEF;
+    rng_state[3] = seed ^ 0xCAFEBABE;
+
+    for (int i = 0; i < 20; ++i)
+        next_prng();
+}
+
+
+/* ============================================================
+   Small-AES — CMR05
+
+   State:
+
+       0   4   8  12
+       1   5   9  13
+       2   6  10  14
+       3   7  11  15
+   ============================================================ */
+
+static const uint8_t SMALL_AES_SBOX[16] = {
+    0x6, 0xB, 0x5, 0x4,
+    0x2, 0xE, 0x7, 0xA,
+    0x9, 0xD, 0xF, 0xC,
+    0x3, 0x1, 0x0, 0x8
+};
+
+
+/* ============================================================
+   GF(2^4)
+   polynomial = x^4 + x + 1
+   ============================================================ */
+
+static uint8_t gf16_mul(uint8_t a, uint8_t b)
+{
+    uint8_t result = 0;
+
+    a &= 0xF;
+    b &= 0xF;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        if (b & 1)
+            result ^= a;
+
+        b >>= 1;
+
+        uint8_t carry = a & 0x8;
+
+        a <<= 1;
+
+        if (carry)
+            a ^= 0x13;
+
+        a &= 0xF;
+    }
+
+    return result & 0xF;
+}
+
+
+/* ============================================================
+   SubBytes
+   ============================================================ */
+
+static void sub_bytes(uint8_t state[STATE_NIBBLES])
+{
+    for (int i = 0; i < STATE_NIBBLES; ++i)
+        state[i] = SMALL_AES_SBOX[state[i] & 0xF];
+}
+
+
+/* ============================================================
+   ShiftRows
+   ============================================================ */
+
+static void shift_rows(uint8_t state[STATE_NIBBLES])
+{
+    uint8_t tmp[STATE_NIBBLES];
+
+    tmp[0]  = state[0];
+    tmp[1]  = state[5];
+    tmp[2]  = state[10];
+    tmp[3]  = state[15];
+
+    tmp[4]  = state[4];
+    tmp[5]  = state[9];
+    tmp[6]  = state[14];
+    tmp[7]  = state[3];
+
+    tmp[8]  = state[8];
+    tmp[9]  = state[13];
+    tmp[10] = state[2];
+    tmp[11] = state[7];
+
+    tmp[12] = state[12];
+    tmp[13] = state[1];
+    tmp[14] = state[6];
+    tmp[15] = state[11];
+
+    memcpy(state, tmp, STATE_NIBBLES);
+}
+
+
+/* ============================================================
+   MixColumns
+   ============================================================ */
+
+static void mix_columns(uint8_t state[STATE_NIBBLES])
+{
+    uint8_t tmp[STATE_NIBBLES];
+
+    for (int col = 0; col < 4; ++col)
+    {
+        int base = 4 * col;
+
+        uint8_t c0 = state[base + 0] & 0xF;
+        uint8_t c1 = state[base + 1] & 0xF;
+        uint8_t c2 = state[base + 2] & 0xF;
+        uint8_t c3 = state[base + 3] & 0xF;
+
+        tmp[base + 0] =
+            gf16_mul(0x2, c0) ^
+            gf16_mul(0x3, c1) ^
+            c2 ^
+            c3;
+
+        tmp[base + 1] =
+            c0 ^
+            gf16_mul(0x2, c1) ^
+            gf16_mul(0x3, c2) ^
+            c3;
+
+        tmp[base + 2] =
+            c0 ^
+            c1 ^
+            gf16_mul(0x2, c2) ^
+            gf16_mul(0x3, c3);
+
+        tmp[base + 3] =
+            gf16_mul(0x3, c0) ^
+            c1 ^
+            c2 ^
+            gf16_mul(0x2, c3);
+
+        tmp[base + 0] &= 0xF;
+        tmp[base + 1] &= 0xF;
+        tmp[base + 2] &= 0xF;
+        tmp[base + 3] &= 0xF;
+    }
+
+    memcpy(state, tmp, STATE_NIBBLES);
+}
+
+
+/* ============================================================
+   AddRoundKey
+   ============================================================ */
+
+static void add_round_key(
+    uint8_t state[STATE_NIBBLES],
+    const uint8_t RK[STATE_NIBBLES])
+{
+    for (int i = 0; i < STATE_NIBBLES; ++i)
+        state[i] ^= RK[i] & 0xF;
+}
+
+
+/* ============================================================
+   Key schedule
+
+   Verified against the reference Small-AES test vector:
+
+   Key = 01 23 45 67 89 ab cd ef
+
+   RK0 =
+   0 1 2 3  4 5 6 7  8 9 a b  c d e f
+
+   RK1 =
+   0 1 a 0  4 4 c 7  c d 6 c  0 0 8 3
+
+   RK2 =
+   4 8 e 6  0 c 2 1  c 1 4 d  c 1 c e
+   ============================================================ */
+
+static void small_aes_key_schedule(
+    const uint8_t key[KEY_BYTES],
+    uint8_t round_keys[ROUNDS + 1][STATE_NIBBLES])
+{
+    /*
+     * Unpack the 64-bit master key into 16 nibbles.
+     */
+    for (int i = 0; i < KEY_BYTES; ++i)
+    {
+        round_keys[0][2 * i] =
+            (key[i] >> 4) & 0xF;
+
+        round_keys[0][2 * i + 1] =
+            key[i] & 0xF;
+    }
+
+    uint8_t kappa = 0x1;
+
+    for (int r = 1; r <= ROUNDS; ++r)
+    {
+        const uint8_t *prev = round_keys[r - 1];
+        uint8_t *curr = round_keys[r];
+
+        /*
+         * RotWord of the last column:
+         *
+         * (12,13,14,15) -> (13,14,15,12)
+         *
+         * followed by the Small-AES S-box.
+         */
+        uint8_t temp[4];
+
+        temp[0] = SMALL_AES_SBOX[prev[13]];
+        temp[1] = SMALL_AES_SBOX[prev[14]];
+        temp[2] = SMALL_AES_SBOX[prev[15]];
+        temp[3] = SMALL_AES_SBOX[prev[12]];
+
+        /*
+         * Round constant is applied to the first nibble.
+         */
+        temp[0] ^= kappa;
+
+        /*
+         * First column.
+         */
+        for (int j = 0; j < 4; ++j)
+            curr[j] = (prev[j] ^ temp[j]) & 0xF;
+
+        /*
+         * Remaining columns:
+         *
+         * W_i = W_{i-4} XOR W_{i-1}
+         */
+        for (int q = 1; q < 4; ++q)
+        {
+            for (int j = 0; j < 4; ++j)
+            {
+                curr[4 * q + j] =
+                    (prev[4 * q + j] ^
+                     curr[4 * (q - 1) + j]) & 0xF;
+            }
+        }
+
+        /*
+         * Next round constant in GF(2^4).
+         */
+        kappa = gf16_mul(0x2, kappa);
+    }
+}
+
+
+/* ============================================================
+   Inverse SubBytes
+   ============================================================ */
+
+static const uint8_t SMALL_AES_INV_SBOX[16] = {
+    0xE, 0xD, 0x4, 0xC,
+    0x3, 0x2, 0x0, 0x6,
+    0xF, 0x8, 0x7, 0x1,
+    0xB, 0x9, 0x5, 0xA
+};
+
+static void inv_sub_bytes(uint8_t state[STATE_NIBBLES])
+{
+    for (int i = 0; i < STATE_NIBBLES; ++i)
+        state[i] = SMALL_AES_INV_SBOX[state[i] & 0xF];
+}
+
+/* ============================================================
+   Inverse ShiftRows
+   ============================================================ */
+
+static void inv_shift_rows(uint8_t state[STATE_NIBBLES])
+{
+    uint8_t tmp[STATE_NIBBLES];
+
+    tmp[0]  = state[0];
+    tmp[1]  = state[13];
+    tmp[2]  = state[10];
+    tmp[3]  = state[7];
+
+    tmp[4]  = state[4];
+    tmp[5]  = state[1];
+    tmp[6]  = state[14];
+    tmp[7]  = state[11];
+
+    tmp[8]  = state[8];
+    tmp[9]  = state[5];
+    tmp[10] = state[2];
+    tmp[11] = state[15];
+
+    tmp[12] = state[12];
+    tmp[13] = state[9];
+    tmp[14] = state[6];
+    tmp[15] = state[3];
+
+    memcpy(state, tmp, STATE_NIBBLES);
+}
+
+/* ============================================================
+   Inverse MixColumns over GF(2^4), p(x)=x^4+x+1
+
+       E B D 9
+       9 E B D
+       D 9 E B
+       B D 9 E
+   ============================================================ */
+
+static void inv_mix_columns(uint8_t state[STATE_NIBBLES])
+{
+    uint8_t tmp[STATE_NIBBLES];
+
+    for (int col = 0; col < 4; ++col)
+    {
+        int base = 4 * col;
+
+        uint8_t c0 = state[base + 0] & 0xF;
+        uint8_t c1 = state[base + 1] & 0xF;
+        uint8_t c2 = state[base + 2] & 0xF;
+        uint8_t c3 = state[base + 3] & 0xF;
+
+        tmp[base + 0] =
+            gf16_mul(0xE, c0) ^
+            gf16_mul(0xB, c1) ^
+            gf16_mul(0xD, c2) ^
+            gf16_mul(0x9, c3);
+
+        tmp[base + 1] =
+            gf16_mul(0x9, c0) ^
+            gf16_mul(0xE, c1) ^
+            gf16_mul(0xB, c2) ^
+            gf16_mul(0xD, c3);
+
+        tmp[base + 2] =
+            gf16_mul(0xD, c0) ^
+            gf16_mul(0x9, c1) ^
+            gf16_mul(0xE, c2) ^
+            gf16_mul(0xB, c3);
+
+        tmp[base + 3] =
+            gf16_mul(0xB, c0) ^
+            gf16_mul(0xD, c1) ^
+            gf16_mul(0x9, c2) ^
+            gf16_mul(0xE, c3);
+
+        tmp[base + 0] &= 0xF;
+        tmp[base + 1] &= 0xF;
+        tmp[base + 2] &= 0xF;
+        tmp[base + 3] &= 0xF;
+    }
+
+    memcpy(state, tmp, STATE_NIBBLES);
+}
+
+/* ============================================================
+   Decryption
+
+   For 5-round Small-AES encryption:
+     ARK0
+     (SB, SR, MC, ARK1)
+     (SB, SR, MC, ARK2)
+     (SB, SR, MC, ARK3)
+     (SB, SR, MC, ARK4)
+     (SB, SR,     ARK5)
+
+   Decryption:
+     ARK5, ISR, ISB,
+     ARK4, IMC, ISR, ISB,
+     ARK3, IMC, ISR, ISB,
+     ARK2, IMC, ISR, ISB,
+     ARK1, IMC, ISR, ISB,
+     ARK0
+   ============================================================ */
+
+static void small_aes_decrypt(
+    uint8_t state[STATE_NIBBLES],
+    const uint8_t round_keys[ROUNDS + 1][STATE_NIBBLES])
+{
+    /* Invert the final encryption round: SB -> SR -> ARK5. */
+    add_round_key(state, round_keys[ROUNDS]);
+    inv_shift_rows(state);
+    inv_sub_bytes(state);
+
+    /* Invert full encryption rounds 4,3,2,1. */
+    for (int r = ROUNDS - 1; r >= 1; --r)
+    {
+        add_round_key(state, round_keys[r]);
+        inv_mix_columns(state);
+        inv_shift_rows(state);
+        inv_sub_bytes(state);
+    }
+
+    /* Invert the initial ARK0. */
+    add_round_key(state, round_keys[0]);
+}
+
+/* ============================================================
+   EXPERIMENT
+
+   Ciphertext structure:
+     - only nibble 0 is active;
+     - nibble 0 takes all 16 values 0,...,15;
+     - the other 15 nibbles are fixed randomly per structure.
+
+   Each structure: C(16,2) = 120 unordered pairs.
+   Structures per key: 2^30.
+   Number of keys: 2^5.
+
+   After decryption, accept a plaintext pair iff:
+
+     D1 = {0,5,10,15}  is active,
+     D2 = {3,4,9,14}   is active,
+     D3 = {2,7,8,13}   is passive,
+     D4 = {1,6,11,12}  is passive.
+
+   Active diagonal  : at least one of its four nibble differences is nonzero.
+   Passive diagonal : all four nibble differences are zero.
+   ============================================================ */
+
+#define NUM_STRUCTURES       (UINT64_C(1) << 30)
+#define TEXTS_PER_STRUCTURE  16
+
+static const int DIAGONALS[4][4] = {
+    {0, 5, 10, 15},
+    {3, 4,  9, 14},
+    {2, 7,  8, 13},
+    {1, 6, 11, 12}
+};
+
+static void generate_fixed_part(uint8_t fixed[BLOCK_NIBBLES])
+{
+    fixed[0] = 0;
+
+    for (int i = 1; i < BLOCK_NIBBLES; ++i)
+        fixed[i] = next_prng() & 0xF;
+}
+
+static void generate_ciphertext(
+    uint8_t ciphertext[BLOCK_NIBBLES],
+    const uint8_t fixed[BLOCK_NIBBLES],
+    uint8_t active_value)
+{
+    memcpy(ciphertext, fixed, BLOCK_NIBBLES);
+    ciphertext[0] = active_value & 0xF;
+}
+
+static inline int has_target_plaintext_pattern(
+    const uint8_t p1[BLOCK_NIBBLES],
+    const uint8_t p2[BLOCK_NIBBLES])
+{
+    int d1_active = 0;
+    int d2_active = 0;
+
+    for (int j = 0; j < 4; ++j)
+    {
+        if ((p1[DIAGONALS[0][j]] ^ p2[DIAGONALS[0][j]]) != 0)
+            d1_active = 1;
+
+        if ((p1[DIAGONALS[1][j]] ^ p2[DIAGONALS[1][j]]) != 0)
+            d2_active = 1;
+
+        /* D3 must be completely passive. */
+        if ((p1[DIAGONALS[2][j]] ^ p2[DIAGONALS[2][j]]) != 0)
+            return 0;
+
+        /* D4 must be completely passive. */
+        if ((p1[DIAGONALS[3][j]] ^ p2[DIAGONALS[3][j]]) != 0)
+            return 0;
+    }
+
+    return d1_active && d2_active;
+}
+
+int main(void)
+{
+    init_prng((uint32_t)time(NULL));
+
+    uint8_t round_keys[ROUNDS + 1][STATE_NIBBLES];
+    uint64_t total_valid_pairs = 0;
+
+    for (int key_index = 0; key_index < NUM_KEYS; ++key_index)
+    {
+        uint8_t key[KEY_BYTES];
+
+        for (int i = 0; i < KEY_BYTES; ++i)
+            key[i] = (uint8_t)(next_prng() & 0xFF);
+
+        small_aes_key_schedule(key, round_keys);
+
+        uint64_t key_valid_pairs = 0;
+
+        for (uint64_t structure = 0;
+             structure < NUM_STRUCTURES;
+             ++structure)
+        {
+            uint8_t fixed[BLOCK_NIBBLES];
+            uint8_t plaintexts[TEXTS_PER_STRUCTURE][BLOCK_NIBBLES];
+
+            generate_fixed_part(fixed);
+
+            for (int v = 0; v < TEXTS_PER_STRUCTURE; ++v)
+            {
+                /* Build a ciphertext from the structure. */
+                generate_ciphertext(
+                    plaintexts[v],
+                    fixed,
+                    (uint8_t)v
+                );
+
+                /* Decrypt in place; the array now contains plaintext. */
+                small_aes_decrypt(
+                    plaintexts[v],
+                    round_keys
+                );
+            }
+
+            /* Test all C(16,2) = 120 unordered plaintext pairs. */
+            for (int a = 0; a < TEXTS_PER_STRUCTURE; ++a)
+            {
+                for (int b = a + 1;
+                     b < TEXTS_PER_STRUCTURE;
+                     ++b)
+                {
+                    if (has_target_plaintext_pattern(
+                            plaintexts[a],
+                            plaintexts[b]))
+                    {
+                        ++key_valid_pairs;
+                    }
+                }
+            }
+
+            /* 256 progress reports per key. */
+            if (((structure + 1) &
+                 ((UINT64_C(1) << 22) - 1)) == 0)
+            {
+                printf(
+                    "Key %3d | Structures %llu / %llu | "
+                    "Pairs tested = %llu | Valid pairs = %llu\n",
+                    key_index,
+                    (unsigned long long)(structure + 1),
+                    (unsigned long long)NUM_STRUCTURES,
+                    (unsigned long long)(
+                        (structure + 1) * UINT64_C(120)
+                    ),
+                    (unsigned long long)key_valid_pairs
+                );
+
+                fflush(stdout);
+            }
+        }
+
+        total_valid_pairs += key_valid_pairs;
+
+        printf(
+            "\n========================================\n"
+            "Key %3d FINISHED\n"
+            "Structures   = %llu\n"
+            "Pairs tested = %llu\n"
+            "Valid pairs  = %llu\n"
+            "Empirical p  = %.17g\n"
+            "========================================\n",
+            key_index,
+            (unsigned long long)NUM_STRUCTURES,
+            (unsigned long long)(
+                NUM_STRUCTURES * UINT64_C(120)
+            ),
+            (unsigned long long)key_valid_pairs,
+            (double)key_valid_pairs /
+                (double)(
+                    NUM_STRUCTURES * UINT64_C(120)
+                )
+        );
+
+        fflush(stdout);
+    }
+
+    printf(
+        "\n========================================\n"
+        "ALL KEYS FINISHED\n"
+        "Number of keys    = %d\n"
+        "Total pairs       = %llu\n"
+        "Total valid pairs = %llu\n"
+        "Overall p         = %.17g\n"
+        "========================================\n",
+        NUM_KEYS,
+        (unsigned long long)(
+            (uint64_t)NUM_KEYS *
+            NUM_STRUCTURES *
+            UINT64_C(120)
+        ),
+        (unsigned long long)total_valid_pairs,
+        (double)total_valid_pairs /
+            (
+                (double)NUM_KEYS *
+                (double)NUM_STRUCTURES *
+                120.0
+            )
+    );
+
+    return 0;
+}
