@@ -1,0 +1,109 @@
+#include <stdio.h>
+#include <math.h>
+
+double delta(int m) {
+    return (m > 0) ? 1.0 : 0.0;
+}
+
+int min_(int a, int b) {
+    return (a < b) ? a : b;
+}
+
+double P_i0(int i) {
+    return 1 - 4 * delta(i - 1) * pow(15, -1)
+           + 10 * delta(i - 2) * pow(15, -2)
+           - 20 * delta(i - 3) * pow(15, -3);
+}
+
+double P_ij(int i, int j) {
+    if (j > 0) {
+        return delta(i - j) * pow(15, -j)
+               - 4 * delta(i - j - 1) * pow(15, -(j + 1))
+               + 10 * delta(i - j - 2) * pow(15, -(j + 2));
+    } else {
+        return P_i0(i);
+    }
+}
+
+double P_igj(int i, int j) {
+    return delta(i - j) * pow(15, -j)
+           - j * (delta(i - j - 1) * pow(15, -(j + 1))
+           - delta(i - j - 2) * pow(15, -(j + 2)));
+}
+
+double combination(int n, int k) {
+    if (k > n || k < 0) return 0;
+    if (k == 0 || k == n) return 1;
+    double result = 1;
+    for (int i = 1; i <= k; i++) {
+        result *= (n - i + 1) / (double)i;
+    }
+    return result;
+}
+
+double permutation(int n, int r) {
+    if (r > n || r < 0) return 0;
+    double result = 1;
+    for (int i = 0; i < r; i++) {
+        result *= (n - i);
+    }
+    return result;
+}
+
+double factorial(int n) {
+    if (n < 0) return 0;
+    if (n == 0 || n == 1) return 1;
+    double result = 1;
+    for (int i = 2; i <= n; i++) {
+        result *= i;
+    }
+    return result;
+}
+
+double compute_triple_sum1(int i, int m) {
+    double total1 = 0.0;
+    int min_mi = (4-m < i) ? 4-m : i;
+    for (int l = 0; l <= min_mi-1; l++) {
+    double term1 = combination(4, l) * P_ij(4-m,l);
+        for (int j = 0; j <= i-l-1; j++) {
+            int sign = (j % 2 == 0) ? 1 : -1;
+
+            double term2 = term1 * combination(i,j) * sign * pow(P_igj(4 - l, 4-i+j), 4);
+            total1 += term2;
+        }
+    }
+    return total1;
+}
+
+double compute_triple_sum2(int i,int m) {
+    double total = 0.0;
+    total = compute_triple_sum1(i,m) * combination(4,m) * pow(1-pow(2,-4),4-m) * pow(2,-16*i-4*m+16) * pow(1-pow(2,-16),-i);
+    return total;
+}
+
+
+double compute_divisor1(int m) {
+    return combination(4,4-m)*pow(2, -64+4*(4-m)) * pow(1 - pow(2, -4), 4-m) * pow(1 - pow(2, -64), -1);
+}
+
+
+int main() {
+    int i,m;
+    printf("Enter i: ");
+    scanf("%d", &i);
+    printf("Enter m: ");
+    scanf("%d", &m);
+
+    double triple_sum_result2 = compute_triple_sum2(i,m);
+    double divisor1 = compute_divisor1(m);
+    double final_result_divided1 = triple_sum_result2 / divisor1;
+
+
+    printf("Probability of Theorem3 for (i,m)=(%d,%d): %.40f\n", i,m,triple_sum_result2);
+    printf("Probability of Theorem3 for (i,m)=(%d,%d)(log2): %.25f\n", i,m,log2(triple_sum_result2));
+    printf("Ratio of Theorem3 to random permutation for (i,m)=(%d,%d): %.25f\n", i,m,final_result_divided1);
+
+
+
+    return 0;
+}
