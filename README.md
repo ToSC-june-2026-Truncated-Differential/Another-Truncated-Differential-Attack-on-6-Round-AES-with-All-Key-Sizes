@@ -1,4 +1,4 @@
-his repository contains the source codes used for the theoretical and experimental evaluation of the 5-round truncated differential distinguisher presented in our work.
+This repository contains the source codes used for the theoretical and experimental evaluation of the 5-round truncated differential distinguisher presented in our work.
 
 The repository includes:
 
